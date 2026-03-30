@@ -2,6 +2,8 @@ import requests
 import csv
 import time
 import random
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
@@ -14,6 +16,14 @@ BASE_DIR.mkdir(parents=True, exist_ok=True)
 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 TOTAL_CSV = BASE_DIR / f"전국전체_{timestamp}.csv"
 LOG_FILE  = BASE_DIR / f"전국전체_{timestamp}_log.txt"
+
+# =========================
+# ⚡ 병렬 처리 설정
+# =========================
+MAX_WORKERS_SIGUNGU  = 10   # 시군구 병렬 수
+MAX_WORKERS_DONG     = 5    # 동 병렬 수 (시군구당)
+REQUEST_SEMAPHORE    = threading.Semaphore(20)  # 동시 요청 상한
+MIN_SLEEP            = 0.1  # 최소 딜레이 (초)
 
 # =========================
 # 🔤 매핑
@@ -38,7 +48,6 @@ PAGE_LIMIT = 20
 
 # =========================
 # 전국 시군구 코드 (5자리)
-# 행안부 API 조회용
 # =========================
 SIGUNGU_CODES = {
     "서울 종로구": "11110", "서울 중구": "11140", "서울 용산구": "11170",
@@ -145,38 +154,38 @@ SIGUNGU_CODES = {
 }
 
 # =========================
-# 로그
+# 로그 (thread-safe)
 # =========================
+_log_lock = threading.Lock()
+
 def log(msg):
     stamp = datetime.now().strftime("%H:%M:%S")
     line = f"[{stamp}] {msg}"
-    print(line)
-    with open(LOG_FILE, "a", encoding="utf-8") as f:
-        f.write(line + "\n")
-
-def sleep(sec=0.5):
-    time.sleep(sec + random.uniform(0, 0.2))
+    with _log_lock:
+        print(line)
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
 
 # =========================
-# 행안부 API → 동 코드 목록 조회
+# 행안부 API → 동 코드 목록
 # =========================
 def get_dong_codes(sigungu_5):
     url = "https://grpc-proxy-server-mkvo6j4wsq-du.a.run.app/v1/regcodes"
     params = {"regcode_pattern": f"{sigungu_5}*", "is_ignore_zero": "true"}
     try:
-        res = requests.get(url, params=params, timeout=15)
+        with REQUEST_SEMAPHORE:
+            res = requests.get(url, params=params, timeout=15)
         if res.status_code == 200:
             codes = res.json().get("regcodes", [])
-            # 법정동 코드 앞 8자리를 직방 동 코드로 사용
             return [(c["code"][:8], c["name"]) for c in codes]
     except Exception as e:
-        log(f"❌ 행안부 API 오류: {e}")
+        log(f"❌ 행안부 API 오류 ({sigungu_5}): {e}")
     return []
 
 # =========================
-# 🔥 직방 API 호출 (동 단위)
+# 직방 API (동 단위) - 재시도 포함
 # =========================
-def fetch_by_dong(dong_code):
+def fetch_by_dong(dong_code, retries=2):
     url = f"https://apis.zigbang.com/apt/locals/{dong_code}/item-catalogs"
     all_items = []
     offset = 0
@@ -190,16 +199,24 @@ def fetch_by_dong(dong_code):
             ("offset", offset),
             ("limit", PAGE_LIMIT),
         ]
-        try:
-            res = requests.get(url, headers=ZIGBANG_HEADERS, params=params, timeout=15)
-        except Exception:
-            break
+        for attempt in range(retries + 1):
+            try:
+                with REQUEST_SEMAPHORE:
+                    res = requests.get(url, headers=ZIGBANG_HEADERS, params=params, timeout=15)
+                break
+            except Exception:
+                if attempt == retries:
+                    return all_items
+                time.sleep(0.5)
 
+        if res.status_code == 429:
+            # Rate limit → 잠시 대기 후 재시도
+            time.sleep(3 + random.uniform(0, 1))
+            continue
         if res.status_code != 200:
             break
 
         data = res.json()
-
         if data.get("count", 0) == 0 and offset == 0:
             break
 
@@ -208,17 +225,16 @@ def fetch_by_dong(dong_code):
             break
 
         all_items.extend(items)
-
         if len(items) < PAGE_LIMIT:
             break
 
         offset += PAGE_LIMIT
-        sleep()
+        time.sleep(MIN_SLEEP + random.uniform(0, 0.1))  # 최소 딜레이
 
     return all_items
 
 # =========================
-# 🔧 데이터 정제
+# 데이터 정제
 # =========================
 def parse_row(item):
     size_m2 = item.get("sizeM2") or 0
@@ -251,7 +267,28 @@ def parse_row(item):
     }
 
 # =========================
-# 💾 CSV 저장
+# 시군구 단위 작업 (병렬 실행 단위)
+# =========================
+def process_sigungu(district_name, sigungu_5):
+    dong_list = get_dong_codes(sigungu_5)
+    if not dong_list:
+        return district_name, []
+
+    local_items = []
+
+    # 동 단위 병렬 호출
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS_DONG) as dong_exec:
+        futures = {dong_exec.submit(fetch_by_dong, dong_code): dong_name
+                   for dong_code, dong_name in dong_list}
+        for future in as_completed(futures):
+            items = future.result()
+            for item in items:
+                local_items.append(parse_row(item))
+
+    return district_name, local_items
+
+# =========================
+# CSV 저장
 # =========================
 def save_csv(rows, path):
     rows = sorted(rows, key=lambda r: (
@@ -265,50 +302,52 @@ def save_csv(rows, path):
     log(f"💾 저장 완료: {path} ({len(rows)}개)")
 
 # =========================
-# 🚀 실행
+# 메인
 # =========================
 def main():
-    log("==== 전국 매물 수집 시작 ====")
+    log("==== 전국 매물 수집 시작 (병렬 최적화) ====")
+    log(f"⚙ 시군구 병렬: {MAX_WORKERS_SIGUNGU} / 동 병렬: {MAX_WORKERS_DONG} / 동시 요청 상한: {REQUEST_SEMAPHORE._value}")
 
     all_items = []
     seen = set()
+    seen_lock = threading.Lock()
+
     total = len(SIGUNGU_CODES)
+    completed = 0
+    start_time = time.time()
 
-    for idx, (district_name, sigungu_5) in enumerate(SIGUNGU_CODES.items(), 1):
-        log(f"\n📍 [{idx}/{total}] {district_name}")
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS_SIGUNGU) as executor:
+        futures = {
+            executor.submit(process_sigungu, name, code): name
+            for name, code in SIGUNGU_CODES.items()
+        }
 
-        dong_list = get_dong_codes(sigungu_5)
-        if not dong_list:
-            log(f"⚠ {district_name}: 동 코드 조회 실패")
-            continue
+        for future in as_completed(futures):
+            district_name, rows = future.result()
+            completed += 1
 
-        district_count = 0
-        for dong_code, dong_name in dong_list:
-            items = fetch_by_dong(dong_code)
-            if not items:
-                continue
+            new_count = 0
+            with seen_lock:
+                for r in rows:
+                    uid = r.get("매물ID")
+                    if uid and uid not in seen:
+                        seen.add(uid)
+                        all_items.append(r)
+                        new_count += 1
 
-            for item in items:
-                r = parse_row(item)
-                uid = r["매물ID"]
-                if uid and uid not in seen:
-                    seen.add(uid)
-                    all_items.append(r)
-                    district_count += 1
-
-            sleep()
-
-        if district_count > 0:
-            log(f"✅ {district_name}: {district_count}개")
-        else:
-            log(f"⚠ {district_name}: 매물 없음")
+            elapsed = time.time() - start_time
+            eta = (elapsed / completed) * (total - completed) if completed else 0
+            status = f"✅ {new_count}개" if new_count else "⚠ 매물없음"
+            log(f"[{completed}/{total}] {district_name}: {status} | "
+                f"경과 {elapsed/60:.1f}분 / 예상잔여 {eta/60:.1f}분")
 
     if not all_items:
         log("❌ 전체 데이터 없음")
         return
 
     save_csv(all_items, TOTAL_CSV)
-    log(f"\n🎉 전체 완료! 총 매물: {len(all_items)}개")
+    total_time = (time.time() - start_time) / 60
+    log(f"\n🎉 완료! 총 매물: {len(all_items)}개 | 소요시간: {total_time:.1f}분")
 
 if __name__ == "__main__":
     main()
