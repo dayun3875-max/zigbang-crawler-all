@@ -1,432 +1,859 @@
+"""
+직방 전국 전 유형 매물 수집 스크립트 (v7 - 전국판)
+대상: 아파트 / 원룸 / 빌라·투룸+ / 오피스텔 / 상가·사무실
+저장: CSV (UTF-8 BOM, 엑셀 호환)
+실행: pip install requests pygeohash
+
+[아파트]
+ - /apt/locals/{시군구코드}/item-catalogs (limit=20, offset 페이지네이션)
+ - 브이월드 API로 전국 읍면동 BBOX + 시군구 코드 자동 추출
+ - tranTypeIn[] 파라미터 인코딩 방지 (Request.prepare)
+[원룸/빌라/오피스텔/상가]
+ - geohash + BBOX 방식
+[공통]
+ - 읍면동 단위 CSV 저장
+ - master CSV 중복 제거 (카테고리+매물ID)
+ - done_emd.txt 캐시로 중단 후 재시작 가능
+ - mark_done은 성공 시에만 (오류 시 재수집)
+ - 전북 코드: 45xxx (2023년 전북특별자치도 개편 반영)
+"""
+
 import requests
-import csv
 import time
 import random
+import csv
+import json
 import threading
-import functools
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import pygeohash as pgh
 from datetime import datetime
 from pathlib import Path
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
+from requests import Request, Session
 
-# =========================
-# 📁 파일 설정
-# =========================
-BASE_DIR = Path("data")
+# =============================================
+# 설정
+# =============================================
+VWORLD_KEY  = "YOUR_VWORLD_KEY_HERE"   # 브이월드 API 키 입력
+BASE_DIR    = Path("data")
 BASE_DIR.mkdir(parents=True, exist_ok=True)
 
-timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-TOTAL_CSV = BASE_DIR / f"전국전체_{timestamp}.csv"
-LOG_FILE  = BASE_DIR / f"전국전체_{timestamp}_log.txt"
+MAX_WORKERS       = 8
+BATCH_SIZE        = 50
+GH_PRECISION      = 5
+GEOHASH_STEP      = 0.04
+SLEEP_EVERY_N     = 10
+DELAY_MIN         = 0.3
+DELAY_MAX         = 0.6
+APT_PAGE_LIMIT    = 20      # 25 이상 400 오류 → 20 고정
 
-# =========================
-# ⚡ 병렬 처리 설정 (보수적으로 조정)
-# =========================
-MAX_WORKERS_SIGUNGU  = 5    # 10 → 5 (행안부 API 부하 감소)
-MAX_WORKERS_DONG     = 3    # 5  → 3
-REQUEST_SEMAPHORE    = threading.Semaphore(10)  # 20 → 10
-MIN_SLEEP            = 0.3  # 0.1 → 0.3 (딜레이 증가)
+TARGET_SIDO = None  # None=전국 / 특정 시도만 수집 시: ["서울특별시", "경기도"]
 
-# 행안부 API 전용 세마포어 (직방과 분리)
-HANABU_SEMAPHORE     = threading.Semaphore(5)
+timestamp  = datetime.now().strftime("%Y%m%d_%H%M%S")
+LOG_FILE   = BASE_DIR / f"zigbang_전국_{timestamp}_log.txt"
+DONE_LOG   = BASE_DIR / "done_emd.txt"
+EMD_CACHE  = BASE_DIR / "emd_bbox_cache.json"
+MASTER_CSV = BASE_DIR / f"zigbang_전국_전체_{timestamp}.csv"
 
-# =========================
-# 🔤 매핑
-# =========================
-TRAN_TYPE_KR = {"trade": "매매", "charter": "전세", "rental": "월세"}
-DIRECTION_KR = {
+# ── API 엔드포인트 ──────────────────────────────────────────
+APT_CATALOG_URL  = "https://apis.zigbang.com/apt/locals/{local_code}/item-catalogs"
+ONEROOM_URL      = "https://apis.zigbang.com/house/property/v1/items/onerooms"
+VILLA_URL        = "https://apis.zigbang.com/house/property/v1/items/villas"
+OFFICETL_URL     = "https://apis.zigbang.com/house/property/v1/items/officetels"
+DETAIL_URL       = "https://apis.zigbang.com/house/property/v1/items/list"
+STORE_LIST_URL   = "https://apis.zigbang.com/v2/store/article/stores"
+STORE_DETAIL_URL = "https://apis.zigbang.com/v2/store/article/stores/list"
+
+# ── 매핑 ────────────────────────────────────────────────────
+TRAN_KR = {
+    "trade": "매매", "charter": "전세", "rental": "월세",
+    "매매": "매매", "전세": "전세", "월세": "월세",
+}
+URL_PATH = {
+    "원룸": "oneroom", "투룸_빌라": "villa",
+    "오피스텔": "officetel", "아파트": "apt", "상가사무실": "store",
+}
+DIR_KR = {
     "e": "동향", "w": "서향", "s": "남향", "n": "북향",
     "se": "남동향", "sw": "남서향", "ne": "북동향", "nw": "북서향",
 }
+SIDO_CODE_MAP = {
+    "11": "서울특별시",   "26": "부산광역시",   "27": "대구광역시",
+    "28": "인천광역시",   "29": "광주광역시",   "30": "대전광역시",
+    "31": "울산광역시",   "36": "세종특별자치시", "41": "경기도",
+    "42": "강원특별자치도", "43": "충청북도",   "44": "충청남도",
+    "45": "전북특별자치도", "46": "전라남도",   "47": "경상북도",
+    "48": "경상남도",     "50": "제주특별자치도",
+}
 
-ZIGBANG_HEADERS = {
+HEADERS = {
     "accept": "application/json, text/plain, */*",
     "accept-language": "ko-KR,ko;q=0.9",
+    "content-type": "application/json",
     "origin": "https://www.zigbang.com",
     "referer": "https://www.zigbang.com/",
-    "sdk-version": "0.112.0",
-    "user-agent": "Mozilla/5.0",
+    "user-agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 Chrome/145.0.0.0 Safari/537.36"
+    ),
     "x-zigbang-platform": "www",
 }
 
-PAGE_LIMIT = 20
+NON_APT_LABELS = ["원룸", "투룸_빌라", "오피스텔", "상가사무실"]
 
-# =========================
-# 전국 시군구 코드 (5자리)
-# =========================
-SIGUNGU_CODES = {
-    "서울 종로구": "11110", "서울 중구": "11140", "서울 용산구": "11170",
-    "서울 성동구": "11200", "서울 광진구": "11215", "서울 동대문구": "11230",
-    "서울 중랑구": "11260", "서울 성북구": "11290", "서울 강북구": "11305",
-    "서울 도봉구": "11320", "서울 노원구": "11350", "서울 은평구": "11380",
-    "서울 서대문구": "11410", "서울 마포구": "11440", "서울 양천구": "11470",
-    "서울 강서구": "11500", "서울 구로구": "11530", "서울 금천구": "11545",
-    "서울 영등포구": "11560", "서울 동작구": "11590", "서울 관악구": "11620",
-    "서울 서초구": "11650", "서울 강남구": "11680", "서울 송파구": "11710",
-    "서울 강동구": "11740",
-    "부산 중구": "26110", "부산 서구": "26140", "부산 동구": "26170",
-    "부산 영도구": "26200", "부산 부산진구": "26230", "부산 동래구": "26260",
-    "부산 남구": "26290", "부산 북구": "26320", "부산 해운대구": "26350",
-    "부산 사하구": "26380", "부산 금정구": "26410", "부산 강서구": "26440",
-    "부산 연제구": "26470", "부산 수영구": "26500", "부산 사상구": "26530",
-    "부산 기장군": "26710",
-    "대구 중구": "27110", "대구 동구": "27140", "대구 서구": "27170",
-    "대구 남구": "27200", "대구 북구": "27230", "대구 수성구": "27260",
-    "대구 달서구": "27290", "대구 달성군": "27710", "대구 군위군": "27720",
-    "인천 중구": "28110", "인천 동구": "28140", "인천 미추홀구": "28177",
-    "인천 연수구": "28185", "인천 남동구": "28200", "인천 부평구": "28237",
-    "인천 계양구": "28245", "인천 서구": "28260", "인천 강화군": "28710",
-    "인천 옹진군": "28720",
-    "광주 동구": "29110", "광주 서구": "29140", "광주 남구": "29155",
-    "광주 북구": "29170", "광주 광산구": "29200",
-    "대전 동구": "30110", "대전 중구": "30140", "대전 서구": "30170",
-    "대전 유성구": "30200", "대전 대덕구": "30230",
-    "울산 중구": "31110", "울산 남구": "31140", "울산 동구": "31170",
-    "울산 북구": "31200", "울산 울주군": "31710",
-    "세종특별자치시": "36110",
-    "경기 수원시 장안구": "41111", "경기 수원시 권선구": "41113",
-    "경기 수원시 팔달구": "41115", "경기 수원시 영통구": "41117",
-    "경기 성남시 수정구": "41131", "경기 성남시 중원구": "41133",
-    "경기 성남시 분당구": "41135",
-    "경기 의정부시": "41150",
-    "경기 안양시 만안구": "41171", "경기 안양시 동안구": "41173",
-    "경기 부천시": "41190",
-    "경기 광명시": "41210", "경기 평택시": "41220", "경기 동두천시": "41250",
-    "경기 안산시 상록구": "41271", "경기 안산시 단원구": "41273",
-    "경기 고양시 덕양구": "41281", "경기 고양시 일산동구": "41285",
-    "경기 고양시 일산서구": "41287",
-    "경기 과천시": "41290", "경기 구리시": "41310", "경기 남양주시": "41360",
-    "경기 오산시": "41370", "경기 시흥시": "41390", "경기 군포시": "41410",
-    "경기 의왕시": "41430", "경기 하남시": "41450",
-    "경기 용인시 처인구": "41461", "경기 용인시 기흥구": "41463",
-    "경기 용인시 수지구": "41465",
-    "경기 파주시": "41480", "경기 이천시": "41500", "경기 안성시": "41550",
-    "경기 김포시": "41570",
-    "경기 화성시": "41590",
-    "경기 광주시": "41610", "경기 양주시": "41630", "경기 포천시": "41650",
-    "경기 여주시": "41670", "경기 연천군": "41800", "경기 가평군": "41820",
-    "경기 양평군": "41830",
-    "충북 청주시 상당구": "43111", "충북 청주시 서원구": "43112",
-    "충북 청주시 흥덕구": "43113", "충북 청주시 청원구": "43114",
-    "충북 충주시": "43130", "충북 제천시": "43150", "충북 보은군": "43720",
-    "충북 옥천군": "43730", "충북 영동군": "43740", "충북 증평군": "43745",
-    "충북 진천군": "43750", "충북 괴산군": "43760", "충북 음성군": "43770",
-    "충북 단양군": "43800",
-    "충남 천안시 동남구": "44131", "충남 천안시 서북구": "44133",
-    "충남 공주시": "44150", "충남 보령시": "44180", "충남 아산시": "44200",
-    "충남 서산시": "44210", "충남 논산시": "44230", "충남 계룡시": "44250",
-    "충남 당진시": "44270", "충남 금산군": "44710", "충남 부여군": "44760",
-    "충남 서천군": "44770", "충남 청양군": "44790", "충남 홍성군": "44800",
-    "충남 예산군": "44810", "충남 태안군": "44825",
-    "전남 목포시": "46110", "전남 여수시": "46130", "전남 순천시": "46150",
-    "전남 나주시": "46170", "전남 광양시": "46230", "전남 담양군": "46710",
-    "전남 곡성군": "46720", "전남 구례군": "46730", "전남 고흥군": "46770",
-    "전남 보성군": "46780", "전남 화순군": "46790", "전남 장흥군": "46800",
-    "전남 강진군": "46810", "전남 해남군": "46820", "전남 영암군": "46830",
-    "전남 무안군": "46840", "전남 함평군": "46860", "전남 영광군": "46870",
-    "전남 장성군": "46880", "전남 완도군": "46890", "전남 진도군": "46900",
-    "전남 신안군": "46910",
-    "경북 포항시 남구": "47111", "경북 포항시 북구": "47113",
-    "경북 경주시": "47130", "경북 김천시": "47150", "경북 안동시": "47170",
-    "경북 구미시": "47190", "경북 영주시": "47210", "경북 영천시": "47230",
-    "경북 상주시": "47250", "경북 문경시": "47280", "경북 경산시": "47290",
-    "경북 의성군": "47730", "경북 청송군": "47750", "경북 영양군": "47760",
-    "경북 영덕군": "47770", "경북 청도군": "47820", "경북 고령군": "47830",
-    "경북 성주군": "47840", "경북 칠곡군": "47850", "경북 예천군": "47900",
-    "경북 봉화군": "47920", "경북 울진군": "47930", "경북 울릉군": "47940",
-    "경남 창원시 의창구": "48121", "경남 창원시 성산구": "48123",
-    "경남 창원시 마산합포구": "48125", "경남 창원시 마산회원구": "48127",
-    "경남 창원시 진해구": "48129",
-    "경남 진주시": "48170", "경남 통영시": "48220", "경남 사천시": "48240",
-    "경남 김해시": "48250", "경남 밀양시": "48270", "경남 거제시": "48310",
-    "경남 양산시": "48330", "경남 의령군": "48720", "경남 함안군": "48730",
-    "경남 창녕군": "48740", "경남 고성군": "48820", "경남 남해군": "48840",
-    "경남 하동군": "48850", "경남 산청군": "48860", "경남 함양군": "48870",
-    "경남 거창군": "48880", "경남 합천군": "48890",
-    "제주 제주시": "50110", "제주 서귀포시": "50130",
-    "강원 춘천시": "51110", "강원 원주시": "51130", "강원 강릉시": "51150",
-    "강원 동해시": "51170", "강원 태백시": "51190", "강원 속초시": "51210",
-    "강원 삼척시": "51230", "강원 홍천군": "51720", "강원 횡성군": "51730",
-    "강원 영월군": "51750", "강원 평창군": "51760", "강원 정선군": "51770",
-    "강원 철원군": "51780", "강원 화천군": "51790", "강원 양구군": "51800",
-    "강원 인제군": "51810", "강원 고성군": "51820", "강원 양양군": "51830",
-    "전북 전주시 완산구": "52111", "전북 전주시 덕진구": "52113",
-    "전북 군산시": "52130", "전북 익산시": "52140", "전북 정읍시": "52180",
-    "전북 남원시": "52190", "전북 김제시": "52210", "전북 완주군": "52710",
-    "전북 진안군": "52720", "전북 무주군": "52730", "전북 장수군": "52740",
-    "전북 임실군": "52750", "전북 순창군": "52770", "전북 고창군": "52790",
-    "전북 부안군": "52800",
-}
+COLUMNS = [
+    "매물구분", "시도", "시군구", "읍면동", "수집시간", "매물ID", "제목",
+    "거래유형", "거래유형_영문",
+    "매매가(만원)", "보증금(만원)", "월세(만원)", "가격(억)",
+    "단지명", "주소", "층", "건물층수", "방향",
+    "면적_m2", "면적_평", "공급면적_m2", "전용면적_m2",
+    "서비스유형", "관리비", "등록일", "신규여부",
+    "권리금(만원)", "상가업종",
+    "매물URL", "위도", "경도",
+]
 
-# =========================
-# 로그 (thread-safe)
-# =========================
-_log_lock = threading.Lock()
+# =============================================
+# 스레드 안전 전역 변수
+# =============================================
+log_lock      = Lock()
+done_lock     = Lock()
+csv_lock      = Lock()
+master_lock   = Lock()
+written_lock  = Lock()
 
+_done_set         = set()
+_master_csv_init  = False
+_written_ids      = set()
+_http_session     = Session()
+
+# =============================================
+# 유틸 함수
+# =============================================
 def log(msg):
-    stamp = datetime.now().strftime("%H:%M:%S")
-    line = f"[{stamp}] {msg}"
-    with _log_lock:
-        print(line)
+    stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    line  = f"[{stamp}] {msg}"
+    print(line)
+    with log_lock:
         with open(LOG_FILE, "a", encoding="utf-8") as f:
             f.write(line + "\n")
 
-# =========================
-# 행안부 API → 동 코드 목록
-# ✅ 수정: 전용 세마포어 + 최대 5회 재시도 + lru_cache로 중복 호출 방지
-# =========================
-@functools.lru_cache(maxsize=None)
-def get_dong_codes(sigungu_5):
-    url = "https://grpc-proxy-server-mkvo6j4wsq-du.a.run.app/v1/regcodes"
-    params = {"regcode_pattern": f"{sigungu_5}*", "is_ignore_zero": "true"}
+def sleep_rand():
+    time.sleep(random.uniform(DELAY_MIN, DELAY_MAX))
 
-    for attempt in range(5):
+def get_m2(val):
+    if isinstance(val, dict):
+        return val.get("m2", "")
+    return val or ""
+
+def get_sido_from_code(code2):
+    return SIDO_CODE_MAP.get(code2, "기타")
+
+def _empty_row():
+    return {col: "" for col in COLUMNS}
+
+# ── done 캐시 ────────────────────────────────────────────────
+def _load_done_set():
+    global _done_set
+    if DONE_LOG.exists():
+        _done_set = set(DONE_LOG.read_text(encoding="utf-8").splitlines())
+    log(f"✅ 완료 캐시 로드: {len(_done_set)}개")
+
+def already_done(key):
+    return key in _done_set
+
+def mark_done(key):
+    _done_set.add(key)
+    with done_lock:
+        with open(DONE_LOG, "a", encoding="utf-8") as f:
+            f.write(key + "\n")
+
+# ── master CSV 중복 제거 ─────────────────────────────────────
+def _check_and_mark_written(rows):
+    new_rows = []
+    with written_lock:
+        for r in rows:
+            uid = f"{r.get('매물구분', '')}_{r.get('매물ID', '')}"
+            if uid not in _written_ids:
+                _written_ids.add(uid)
+                new_rows.append(r)
+    return new_rows
+
+def append_master_csv(rows):
+    global _master_csv_init
+    new_rows = _check_and_mark_written(rows)
+    if not new_rows:
+        return 0
+    with master_lock:
+        mode = "w" if not _master_csv_init else "a"
+        with open(MASTER_CSV, mode, newline="", encoding="utf-8-sig") as f:
+            writer = csv.DictWriter(f, fieldnames=COLUMNS, extrasaction="ignore")
+            if not _master_csv_init:
+                writer.writeheader()
+                _master_csv_init = True
+            writer.writerows(new_rows)
+    return len(new_rows)
+
+def save_local_csv(rows, sido_nm, sgg_nm, emd_nm, category_suffix=""):
+    if not rows:
+        return
+    suffix  = f"_{category_suffix}" if category_suffix else ""
+    out_csv = (
+        BASE_DIR / sido_nm / sgg_nm
+        / f"zigbang_{sgg_nm}_{emd_nm}{suffix}_{timestamp}.csv"
+    )
+    out_csv.parent.mkdir(parents=True, exist_ok=True)
+    with csv_lock:
+        with open(out_csv, "w", newline="", encoding="utf-8-sig") as f:
+            writer = csv.DictWriter(f, fieldnames=COLUMNS, extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows(rows)
+    log(f"  💾 {out_csv.name} ({len(rows):,}개)")
+
+# =============================================
+# HTTP 유틸
+# =============================================
+def rget(url, params=None, retries=3):
+    for i in range(retries):
         try:
-            with HANABU_SEMAPHORE:
-                res = requests.get(url, params=params, timeout=15)
-
-            if res.status_code == 200:
-                codes = res.json().get("regcodes", [])
-                return [(c["code"][:8], c["name"]) for c in codes]
-
-            elif res.status_code == 429:
-                wait = 5 * (attempt + 1)
-                log(f"⏳ 행안부 API rate limit ({sigungu_5}), {wait}초 대기 후 재시도 [{attempt+1}/5]...")
+            r = requests.get(url, headers=HEADERS, params=params, timeout=15)
+            if r.status_code == 200:
+                return r.json()
+            if r.status_code in (429, 503):
+                wait = 30 * (i + 1)
+                log(f"  ⚠️ {r.status_code} → {wait}초 대기")
                 time.sleep(wait)
-
-            else:
-                log(f"⚠ 행안부 API HTTP {res.status_code} ({sigungu_5}), 재시도 [{attempt+1}/5]")
-                time.sleep(2 * (attempt + 1))
-
+            elif r.status_code == 400:
+                return None
         except Exception as e:
-            wait = 2 * (attempt + 1)
-            log(f"❌ 행안부 API 오류 ({sigungu_5}): {e} → {wait}초 후 재시도 [{attempt+1}/5]")
-            time.sleep(wait)
+            if i == retries - 1:
+                log(f"  ❌ GET 오류: {e}")
+        time.sleep(2 * (i + 1))
+    return None
 
-    log(f"🚫 행안부 API 최종 실패 ({sigungu_5}): 동코드 조회 불가")
-    return []
+def rget_raw(url, params_str, retries=3):
+    """tranTypeIn[0] 등 대괄호 인코딩 방지용 raw GET"""
+    for i in range(retries):
+        try:
+            req    = Request("GET", url, headers=HEADERS)
+            prepped = req.prepare()
+            prepped.url = url + "?" + params_str
+            r = _http_session.send(prepped, timeout=15)
+            if r.status_code == 200:
+                return r.json()
+            if r.status_code in (429, 503):
+                wait = 30 * (i + 1)
+                log(f"  ⚠️ {r.status_code} → {wait}초 대기")
+                time.sleep(wait)
+            elif r.status_code == 400:
+                return None
+        except Exception as e:
+            if i == retries - 1:
+                log(f"  ❌ RAW GET 오류: {e}")
+        time.sleep(2 * (i + 1))
+    return None
 
-# =========================
-# 직방 API (동 단위) - 재시도 포함
-# ✅ 수정: 429 발생 시 재시도 횟수 증가, 대기시간 증가
-# =========================
-def fetch_by_dong(dong_code, retries=3):
-    url = f"https://apis.zigbang.com/apt/locals/{dong_code}/item-catalogs"
-    all_items = []
-    offset = 0
+def rpost(url, body, retries=3):
+    for i in range(retries):
+        try:
+            r = requests.post(url, headers=HEADERS, json=body, timeout=15)
+            if r.status_code == 200:
+                return r.json()
+            if r.status_code in (429, 503):
+                wait = 30 * (i + 1)
+                log(f"  ⚠️ {r.status_code} → {wait}초 대기")
+                time.sleep(wait)
+            elif r.status_code == 400:
+                break
+        except Exception as e:
+            if i == retries - 1:
+                log(f"  ❌ POST 오류: {e}")
+        time.sleep(2 * (i + 1))
+    return None
+
+# =============================================
+# [1단계] 브이월드 → 전국 읍면동 BBOX + 시군구 코드 추출
+# =============================================
+def fetch_emd_bbox_from_vworld():
+    if EMD_CACHE.exists():
+        with open(EMD_CACHE, encoding="utf-8") as f:
+            cached = json.load(f)
+        if cached:
+            log(f"✅ 읍면동 캐시 로드: {len(cached)}개")
+            return cached
+        EMD_CACHE.unlink()
+
+    log("🌐 브이월드 API 전국 읍면동 수집 시작...")
+    emd_dict    = {}
+    page        = 1
+    total_pages = None
 
     while True:
-        params = [
-            ("tranTypeIn[]", "trade"),
-            ("tranTypeIn[]", "charter"),
-            ("tranTypeIn[]", "rental"),
-            ("includeOfferItem", "true"),
-            ("offset", offset),
-            ("limit", PAGE_LIMIT),
-        ]
-        for attempt in range(retries + 1):
+        params = {
+            "service": "data", "request": "GetFeature",
+            "data": "LT_C_ADEMD_INFO", "key": VWORLD_KEY,
+            "domain": "localhost", "format": "json",
+            "size": "1000", "page": str(page),
+            "geometry": "true", "attribute": "true",
+            "geomFilter": "BOX(124.0,33.0,132.0,39.0)",
+            "crs": "EPSG:4326",
+        }
+        features = []
+        for attempt in range(3):
             try:
-                with REQUEST_SEMAPHORE:
-                    res = requests.get(url, headers=ZIGBANG_HEADERS, params=params, timeout=15)
+                res  = requests.get(
+                    "https://api.vworld.kr/req/data",
+                    params=params, timeout=30
+                )
+                data = res.json()
+                resp = data.get("response", {})
+                if resp.get("status") != "OK":
+                    log(f"  ❌ 브이월드 상태 오류: {resp.get('status')}")
+                    break
+                if total_pages is None:
+                    total_pages = int(resp.get("page", {}).get("total", 1))
+                    total_cnt   = resp.get("record", {}).get("total", "?")
+                    log(f"  전체 읍면동: {total_cnt}개 | 전체 페이지: {total_pages}개")
+                features = (
+                    resp.get("result", {})
+                        .get("featureCollection", {})
+                        .get("features", [])
+                )
+                for feat in features:
+                    props   = feat.get("properties", {})
+                    geom    = feat.get("geometry", {})
+                    emd_cd  = props.get("emd_cd", "")
+                    emd_nm  = props.get("emd_kor_nm", "")
+                    sgg_nm  = props.get("sig_kor_nm", "")
+                    sido_nm = props.get("ctp_kor_nm", "") or \
+                              get_sido_from_code(emd_cd[:2] if emd_cd else "")
+                    coords = []
+                    if geom.get("type") == "Polygon":
+                        coords = geom["coordinates"][0]
+                    elif geom.get("type") == "MultiPolygon":
+                        for poly in geom["coordinates"]:
+                            coords.extend(poly[0])
+                    if not coords:
+                        continue
+                    lngs = [c[0] for c in coords]
+                    lats = [c[1] for c in coords]
+                    key  = f"{sgg_nm}_{emd_nm}_{emd_cd}"
+                    emd_dict[key] = {
+                        "sido_nm": sido_nm,
+                        "sgg_nm":  sgg_nm,
+                        "emd_nm":  emd_nm,
+                        "emd_cd":  emd_cd,
+                        "sgg_cd":  emd_cd[:5],
+                        "min_lat": min(lats), "max_lat": max(lats),
+                        "min_lng": min(lngs), "max_lng": max(lngs),
+                    }
                 break
-            except Exception:
-                if attempt == retries:
-                    return all_items
-                time.sleep(1 * (attempt + 1))
+            except Exception as e:
+                log(f"  ❌ 브이월드 오류 ({attempt+1}/3): {e}")
+                time.sleep(3)
 
-        if res.status_code == 429:
-            wait = 5 + random.uniform(0, 3)
-            log(f"⏳ 직방 API rate limit (dong={dong_code}), {wait:.1f}초 대기...")
-            time.sleep(wait)
-            continue
-
-        if res.status_code != 200:
+        if page % 50 == 0:
+            log(f"  페이지 {page}/{total_pages} | 누적: {len(emd_dict)}개")
+        if not features or (total_pages and page >= total_pages):
             break
+        page += 1
+        time.sleep(0.3)
 
-        data = res.json()
-        if data.get("count", 0) == 0 and offset == 0:
+    with open(EMD_CACHE, "w", encoding="utf-8") as f:
+        json.dump(emd_dict, f, ensure_ascii=False, indent=2)
+    log(f"✅ 읍면동 수집 완료: {len(emd_dict)}개 → 캐시 저장")
+    return emd_dict
+
+# =============================================
+# [Phase 1] 아파트: 시군구 코드 기반 수집
+# =============================================
+def _apt_catalog_params(offset, limit):
+    return (
+        f"tranTypeIn[0]=trade&tranTypeIn[1]=charter&tranTypeIn[2]=rental"
+        f"&includeOfferItem=true&offset={offset}&limit={limit}"
+    )
+
+def fetch_apt_by_local(sgg_cd):
+    url       = APT_CATALOG_URL.format(local_code=sgg_cd)
+    all_items = []
+    offset    = 0
+    total     = None
+
+    while True:
+        params_str = _apt_catalog_params(offset, APT_PAGE_LIMIT)
+        data = rget_raw(url, params_str)
+        if not data:
             break
-
+        if total is None:
+            total = data.get("count", 0)
+            if total == 0:
+                break
         items = data.get("list") or []
         if not items:
             break
-
         all_items.extend(items)
-        if len(items) < PAGE_LIMIT:
+        offset += len(items)
+        if offset >= total:
             break
+        sleep_rand()
 
-        offset += PAGE_LIMIT
-        time.sleep(MIN_SLEEP + random.uniform(0, 0.2))
+    return all_items, total or 0
 
-    return all_items
+def parse_apt_catalog(item, sido_nm, sgg_nm):
+    now      = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    tran     = item.get("tranType", "")
+    dep      = item.get("depositMin") or 0
+    rent     = item.get("rentMin") or 0
+    size_ex  = item.get("sizeM2") or 0
+    size_con = item.get("sizeContractM2") or 0
+    emd_nm   = item.get("local3", "")
 
-# =========================
-# 데이터 정제
-# =========================
-def parse_row(item):
-    size_m2 = item.get("sizeM2") or 0
-    deposit = item.get("depositMin", 0) or 0
-    rent = item.get("rentMin", 0) or 0
-    rt = item.get("roomTypeTitle") or {}
-    tran = item.get("tranType", "")
-    item_id = ""
-    item_list = item.get("itemIdList") or [{}]
-    if item_list and isinstance(item_list[0], dict):
-        item_id = item_list[0].get("itemId", "")
+    iid = ""
+    id_list = item.get("itemIdList") or []
+    if id_list and isinstance(id_list[0], dict):
+        iid = str(id_list[0].get("itemId", ""))
+    elif id_list:
+        iid = str(id_list[0])
 
-    return {
-        "수집시간": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "단지명": item.get("areaDanjiName"),
-        "시도": item.get("local1"),
-        "구": item.get("local2"),
-        "동": item.get("local3"),
-        "거래유형": TRAN_TYPE_KR.get(tran, ""),
-        "층": item.get("floor"),
-        "면적(m2)": size_m2,
-        "평": round(size_m2 / 3.3058, 2) if size_m2 else "",
-        "보증금": deposit,
-        "월세": rent,
-        "가격(억)": round(deposit / 10000, 2) if deposit else 0,
-        "타입": rt.get("p") if isinstance(rt, dict) else "",
-        "방향": DIRECTION_KR.get(item.get("direction", "")),
-        "매물ID": item_id,
-        "URL": f"https://www.zigbang.com/home/apt/items/{item_id}"
-    }
+    price = dep if tran == "trade" else 0
 
-# =========================
-# 시군구 단위 작업 (병렬 실행 단위)
-# ✅ 수정: 동코드 조회 실패 시 경고 로그 출력
-# =========================
-def process_sigungu(district_name, sigungu_5):
-    dong_list = get_dong_codes(sigungu_5)
-    if not dong_list:
-        log(f"⚠ 동코드 없음 → 건너뜀: {district_name} ({sigungu_5})")
-        return district_name, []
+    row = _empty_row()
+    row.update({
+        "매물구분":      "아파트",
+        "시도":          sido_nm,
+        "시군구":        sgg_nm,
+        "읍면동":        emd_nm,
+        "수집시간":      now,
+        "매물ID":        iid,
+        "제목":          item.get("itemTitle", ""),
+        "단지명":        item.get("areaDanjiName", ""),
+        "거래유형":      TRAN_KR.get(tran, tran),
+        "거래유형_영문": tran,
+        "매매가(만원)":  price,
+        "보증금(만원)":  dep,
+        "월세(만원)":    rent if tran == "rental" else 0,
+        "가격(억)":      round(price / 10000, 2) if price else round(dep / 10000, 2),
+        "층":            item.get("floor", ""),
+        "방향":          DIR_KR.get(item.get("direction", ""), ""),
+        "면적_m2":       size_ex,
+        "면적_평":       round(float(size_ex) / 3.3058, 2) if size_ex else "",
+        "공급면적_m2":   size_con,
+        "전용면적_m2":   size_ex,
+        "서비스유형":    "아파트",
+        "매물URL":       f"https://www.zigbang.com/home/apt/items/{iid}" if iid else "",
+    })
+    return row
 
-    local_items = []
+def collect_apt_for_sgg(sgg_cd, sido_nm, sgg_nm):
+    done_key = f"APT_SGG_{sgg_cd}"
+    if already_done(done_key):
+        return 0
+    try:
+        items, total = fetch_apt_by_local(sgg_cd)
+        if not items:
+            mark_done(done_key)
+            return 0
+        rows = [parse_apt_catalog(i, sido_nm, sgg_nm) for i in items]
+        rows = [r for r in rows if r.get("매물ID")]
 
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS_DONG) as dong_exec:
-        futures = {dong_exec.submit(fetch_by_dong, dong_code): dong_name
-                   for dong_code, dong_name in dong_list}
-        for future in as_completed(futures):
-            items = future.result()
-            for item in items:
-                local_items.append(parse_row(item))
+        if rows:
+            log(f"  ✅ {sgg_nm} [아파트] {len(rows):,}개 (전체: {total:,})")
+            by_emd = defaultdict(list)
+            for r in rows:
+                by_emd[r.get("읍면동", "기타")].append(r)
+            for emd_nm, emd_rows in by_emd.items():
+                save_local_csv(emd_rows, sido_nm, sgg_nm, emd_nm, "아파트")
+            append_master_csv(rows)
 
-    return district_name, local_items
+        mark_done(done_key)
+        return len(rows)
+    except Exception as e:
+        log(f"  ❌ {sgg_nm} [아파트] 오류: {e}")
+        return 0
 
-# =========================
-# CSV 저장
-# =========================
-def save_csv(rows, path):
-    rows = sorted(rows, key=lambda r: (
-        r.get("시도") or "", r.get("구") or "",
-        r.get("동") or "", r.get("단지명") or "", r.get("가격(억)") or 0
-    ))
-    with open(path, "w", newline="", encoding="utf-8-sig") as f:
-        writer = csv.DictWriter(f, fieldnames=rows[0].keys())
-        writer.writeheader()
-        writer.writerows(rows)
-    log(f"💾 저장 완료: {path} ({len(rows)}개)")
+# =============================================
+# [Phase 2] 원룸/빌라/오피스텔/상가: geohash 기반
+# =============================================
+def bbox_to_geohashes(bbox, precision=GH_PRECISION):
+    hashes = set()
+    step   = GEOHASH_STEP
+    lat_range = bbox["max_lat"] - bbox["min_lat"]
+    lng_range = bbox["max_lng"] - bbox["min_lng"]
+    if lat_range < step or lng_range < step:
+        step = 0.01
+    lat = bbox["min_lat"]
+    while lat <= bbox["max_lat"] + step:
+        lng = bbox["min_lng"]
+        while lng <= bbox["max_lng"] + step:
+            hashes.add(pgh.encode(lat, lng, precision=precision))
+            lng += step
+        lat += step
+    return list(hashes)
 
-# =========================
+def fetch_house_ids_batch(geohashes, list_url, extra_params=None):
+    all_ids = set()
+    for idx, gh in enumerate(geohashes):
+        params = {"geohash": gh, "depositMin": 0, "rentMin": 0, "salesPriceMin": 0}
+        if extra_params:
+            params.update(extra_params)
+        data = rget(list_url, params=params)
+        if data:
+            items_raw = data.get("items") or []
+            if items_raw and isinstance(items_raw[0], dict):
+                all_ids.update(i["id"] for i in items_raw if "id" in i)
+            else:
+                all_ids.update(items_raw)
+        if idx % SLEEP_EVERY_N == (SLEEP_EVERY_N - 1):
+            sleep_rand()
+    return all_ids
+
+def fetch_house_details(item_ids):
+    results = []
+    for i in range(0, len(item_ids), BATCH_SIZE):
+        chunk = [int(x) for x in list(item_ids)[i:i + BATCH_SIZE]]
+        data  = rpost(DETAIL_URL, {"itemIds": chunk})
+        if data:
+            results.extend(data.get("items") or [])
+        sleep_rand()
+    return results
+
+def fetch_store_ids_batch(geohashes):
+    all_ids = set()
+    for idx, gh in enumerate(geohashes):
+        body = {
+            "domain": "zigbang", "geohash": gh,
+            "shuffle": False, "sales_type": "전체",
+            "first_floor": False, "업종": [],
+        }
+        data = rpost(STORE_LIST_URL, body)
+        if data and isinstance(data, list):
+            for section in data:
+                for loc in (section.get("item_locations") or []):
+                    if loc.get("item_id"):
+                        all_ids.add(loc["item_id"])
+        if idx % SLEEP_EVERY_N == (SLEEP_EVERY_N - 1):
+            sleep_rand()
+    return all_ids
+
+def fetch_store_details(item_ids):
+    results  = []
+    ids_conv = []
+    for x in item_ids:
+        try:
+            ids_conv.append(int(x))
+        except (ValueError, TypeError):
+            ids_conv.append(x)
+    for i in range(0, len(ids_conv), BATCH_SIZE):
+        chunk = ids_conv[i:i + BATCH_SIZE]
+        data  = rpost(STORE_DETAIL_URL, {"item_ids": chunk})
+        if data and isinstance(data, list):
+            results.extend(data)
+        sleep_rand()
+    return results
+
+# ── 파싱: 원룸/빌라/오피스텔 ──────────────────────────────
+def parse_house(item, category, emd_info):
+    now   = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    tran  = item.get("sales_type", "")
+    size  = item.get("size_m2") or 0
+    dep   = item.get("deposit") or 0
+    rent  = item.get("rent") or 0
+    price = item.get("sales_price") or 0
+    iid   = item.get("item_id", "")
+    loc   = item.get("location") or item.get("random_location") or {}
+
+    row = _empty_row()
+    row.update({
+        "매물구분":      category,
+        "시도":          emd_info["sido_nm"],
+        "시군구":        emd_info["sgg_nm"],
+        "읍면동":        emd_info["emd_nm"],
+        "수집시간":      now,
+        "매물ID":        str(iid),
+        "제목":          item.get("title", ""),
+        "거래유형":      TRAN_KR.get(tran, tran),
+        "거래유형_영문": tran,
+        "매매가(만원)":  price,
+        "보증금(만원)":  dep,
+        "월세(만원)":    rent,
+        "가격(억)":      round(price/10000, 2) if price else round(dep/10000, 2),
+        "주소":          item.get("address1", ""),
+        "층":            item.get("floor_string") or str(item.get("floor", "")),
+        "건물층수":      item.get("building_floor", ""),
+        "방향":          DIR_KR.get(item.get("direction", ""), ""),
+        "면적_m2":       size,
+        "면적_평":       round(float(size)/3.3058, 2) if size else "",
+        "공급면적_m2":   get_m2(item.get("공급면적")),
+        "전용면적_m2":   get_m2(item.get("전용면적")),
+        "서비스유형":    item.get("service_type", ""),
+        "관리비":        item.get("manage_cost", ""),
+        "등록일":        item.get("reg_date", ""),
+        "신규여부":      item.get("is_new", ""),
+        "매물URL":       (
+            f"https://www.zigbang.com/home/"
+            f"{URL_PATH.get(category, 'villa')}/items/{iid}"
+        ),
+        "위도":  loc.get("lat", "") if isinstance(loc, dict) else "",
+        "경도":  loc.get("lng", "") if isinstance(loc, dict) else "",
+    })
+    return row
+
+# ── 파싱: 상가 ───────────────────────────────────────────
+def parse_store(item, emd_info):
+    now  = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    st   = item.get("sales_type", "")
+    size = item.get("size_m2") or 0
+    iid  = item.get("item_id", "")
+    dep  = item.get("보증금액") or 0
+    rent = item.get("월세금액") or 0
+    sell = item.get("매매금액") or 0
+    key  = item.get("권리금액") or 0
+
+    row = _empty_row()
+    row.update({
+        "매물구분":      "상가사무실",
+        "시도":          emd_info["sido_nm"],
+        "시군구":        emd_info["sgg_nm"],
+        "읍면동":        emd_info["emd_nm"],
+        "수집시간":      now,
+        "매물ID":        str(iid),
+        "제목":          item.get("title", ""),
+        "상가업종":      item.get("업종", ""),
+        "권리금(만원)":  key,
+        "거래유형":      TRAN_KR.get(st, st),
+        "거래유형_영문": st,
+        "매매가(만원)":  sell,
+        "보증금(만원)":  dep,
+        "월세(만원)":    rent,
+        "가격(억)":      round(sell/10000, 2) if sell else round(dep/10000, 2),
+        "주소":          item.get("address1", ""),
+        "층":            str(item.get("floor", "")),
+        "면적_m2":       size,
+        "면적_평":       round(float(size)/3.3058, 2) if size else "",
+        "서비스유형":    "상가사무실",
+        "관리비":        item.get("manage_cost", ""),
+        "등록일":        item.get("reg_date", ""),
+        "매물URL":       f"https://www.zigbang.com/home/store/items/{iid}",
+        "위도":          item.get("lat", ""),
+        "경도":          item.get("lng", ""),
+    })
+    return row
+
+# ── 읍면동 단위 수집 (원룸/빌라/오피스텔/상가) ───────────
+def collect_emd_non_apt(emd_key, emd_info):
+    sgg_nm  = emd_info["sgg_nm"]
+    emd_nm  = emd_info["emd_nm"]
+    sido_nm = emd_info["sido_nm"]
+    bbox    = {k: emd_info[k] for k in ["min_lat", "max_lat", "min_lng", "max_lng"]}
+    all_rows = []
+
+    geohashes = bbox_to_geohashes(bbox)
+    if not geohashes:
+        for lb in NON_APT_LABELS:
+            mark_done(f"{emd_key}_{lb}")
+        return emd_key, []
+
+    # ── 원룸 ──
+    dk = f"{emd_key}_원룸"
+    if not already_done(dk):
+        try:
+            ids = fetch_house_ids_batch(geohashes, ONEROOM_URL)
+            if ids:
+                items = fetch_house_details(list(ids))
+                rows  = [
+                    r for r in [parse_house(i, "원룸", emd_info) for i in items]
+                    if r.get("서비스유형") == "원룸"
+                ]
+                all_rows.extend(rows)
+                if rows:
+                    log(f"  ✅ {sgg_nm} {emd_nm} [원룸] {len(rows):,}개")
+            mark_done(dk)
+        except Exception as e:
+            log(f"  ❌ {sgg_nm} {emd_nm} [원룸] 오류: {e}")
+
+    # ── 투룸·빌라 ──
+    dk = f"{emd_key}_투룸_빌라"
+    if not already_done(dk):
+        try:
+            ids = fetch_house_ids_batch(geohashes, VILLA_URL)
+            if ids:
+                items = fetch_house_details(list(ids))
+                rows  = [
+                    r for r in [parse_house(i, "투룸_빌라", emd_info) for i in items]
+                    if r.get("서비스유형") == "빌라"
+                ]
+                all_rows.extend(rows)
+                if rows:
+                    log(f"  ✅ {sgg_nm} {emd_nm} [투룸_빌라] {len(rows):,}개")
+            mark_done(dk)
+        except Exception as e:
+            log(f"  ❌ {sgg_nm} {emd_nm} [투룸_빌라] 오류: {e}")
+
+    # ── 오피스텔 ──
+    dk = f"{emd_key}_오피스텔"
+    if not already_done(dk):
+        try:
+            ids = fetch_house_ids_batch(geohashes, OFFICETL_URL, {"withBuildings": "true"})
+            if ids:
+                items = fetch_house_details(list(ids))
+                rows  = [
+                    r for r in [parse_house(i, "오피스텔", emd_info) for i in items]
+                    if r.get("서비스유형") == "오피스텔"
+                ]
+                all_rows.extend(rows)
+                if rows:
+                    log(f"  ✅ {sgg_nm} {emd_nm} [오피스텔] {len(rows):,}개")
+            mark_done(dk)
+        except Exception as e:
+            log(f"  ❌ {sgg_nm} {emd_nm} [오피스텔] 오류: {e}")
+
+    # ── 상가·사무실 ──
+    dk = f"{emd_key}_상가사무실"
+    if not already_done(dk):
+        try:
+            ids = fetch_store_ids_batch(geohashes)
+            if ids:
+                items = fetch_store_details(list(ids))
+                rows  = [parse_store(i, emd_info) for i in items]
+                all_rows.extend(rows)
+                if rows:
+                    log(f"  ✅ {sgg_nm} {emd_nm} [상가사무실] {len(rows):,}개")
+            mark_done(dk)
+        except Exception as e:
+            log(f"  ❌ {sgg_nm} {emd_nm} [상가사무실] 오류: {e}")
+
+    # ── 저장 ──
+    if all_rows:
+        save_local_csv(all_rows, sido_nm, sgg_nm, emd_nm)
+        append_master_csv(all_rows)
+
+    return emd_key, all_rows
+
+# =============================================
 # 메인
-# ✅ 수정: 실패 지역 자동 재수집 로직 추가
-# =========================
+# =============================================
 def main():
-    log("==== 전국 매물 수집 시작 (안정화 버전) ====")
-    log(f"⚙ 시군구 병렬: {MAX_WORKERS_SIGUNGU} / 동 병렬: {MAX_WORKERS_DONG} / 동시 요청 상한: {REQUEST_SEMAPHORE._value}")
+    _load_done_set()
 
-    all_items = []
-    seen = set()
-    seen_lock = threading.Lock()
-    failed_districts = {}   # 실패(매물없음) 지역 기록
+    log("=" * 60)
+    log("직방 전국 전 유형 매물 수집 시작 (v7 전국판)")
+    log("대상: 아파트 · 원룸 · 투룸빌라 · 오피스텔 · 상가사무실")
+    log(f"저장경로: {BASE_DIR.resolve()}")
+    log(f"병렬: {MAX_WORKERS}개 | 아파트 limit={APT_PAGE_LIMIT}")
+    log(f"기타: geohash step={GEOHASH_STEP} | chunk={BATCH_SIZE}개")
+    if TARGET_SIDO:
+        log(f"수집 시도: {TARGET_SIDO}")
+    else:
+        log("수집 시도: 전국")
+    log("=" * 60)
 
-    total = len(SIGUNGU_CODES)
-    completed = 0
-    start_time = time.time()
-
-    def run_collection(codes_dict, pass_label="1차"):
-        nonlocal completed
-        failed = {}
-
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS_SIGUNGU) as executor:
-            futures = {
-                executor.submit(process_sigungu, name, code): (name, code)
-                for name, code in codes_dict.items()
-            }
-
-            for future in as_completed(futures):
-                district_name, rows = future.result()
-                completed += 1
-
-                new_count = 0
-                with seen_lock:
-                    for r in rows:
-                        uid = r.get("매물ID")
-                        if uid and uid not in seen:
-                            seen.add(uid)
-                            all_items.append(r)
-                            new_count += 1
-
-                elapsed = time.time() - start_time
-                eta = (elapsed / completed) * (total - completed) if completed else 0
-                if new_count:
-                    log(f"[{pass_label}][{completed}/{total}] {district_name}: ✅ {new_count}개 | "
-                        f"경과 {elapsed/60:.1f}분 / 예상잔여 {eta/60:.1f}분")
-                else:
-                    log(f"[{pass_label}][{completed}/{total}] {district_name}: ⚠ 매물없음 | "
-                        f"경과 {elapsed/60:.1f}분 / 예상잔여 {eta/60:.1f}분")
-                    name_, code_ = futures[future]
-                    failed[name_] = code_
-
-        return failed
-
-    # --- 1차 수집 ---
-    failed_districts = run_collection(SIGUNGU_CODES, pass_label="1차")
-
-    # --- 2차 재수집: 실패 지역만 (캐시 무효화 후 재시도) ---
-    if failed_districts:
-        log(f"\n🔄 2차 재수집 시작: 실패 {len(failed_districts)}개 지역")
-        log("⏳ 30초 대기 후 재시도 (API 안정화)...")
-        time.sleep(30)
-
-        # lru_cache 무효화 → 행안부 API 재호출
-        get_dong_codes.cache_clear()
-
-        completed = len(SIGUNGU_CODES) - len(failed_districts)  # 이미 완료된 수
-        total_2nd = len(failed_districts)
-        completed_2nd = 0
-
-        with ThreadPoolExecutor(max_workers=max(1, MAX_WORKERS_SIGUNGU // 2)) as executor:
-            futures = {
-                executor.submit(process_sigungu, name, code): (name, code)
-                for name, code in failed_districts.items()
-            }
-            for future in as_completed(futures):
-                district_name, rows = future.result()
-                completed_2nd += 1
-
-                new_count = 0
-                with seen_lock:
-                    for r in rows:
-                        uid = r.get("매물ID")
-                        if uid and uid not in seen:
-                            seen.add(uid)
-                            all_items.append(r)
-                            new_count += 1
-
-                elapsed = time.time() - start_time
-                status = f"✅ {new_count}개" if new_count else "⚠ 여전히 매물없음"
-                log(f"[2차 재수집][{completed_2nd}/{total_2nd}] {district_name}: {status} | "
-                    f"총 경과 {elapsed/60:.1f}분")
-
-    if not all_items:
-        log("❌ 전체 데이터 없음 - 저장 생략")
+    # 브이월드로 전국 읍면동 정보 수집 (캐시 있으면 재사용)
+    emd_dict = fetch_emd_bbox_from_vworld()
+    if not emd_dict:
+        log("❌ 읍면동 목록 수집 실패 → 종료")
         return
 
-    save_csv(all_items, TOTAL_CSV)
-    total_time = (time.time() - start_time) / 60
-    log(f"\n🎉 완료! 총 매물: {len(all_items)}개 | 소요시간: {total_time:.1f}분")
+    # 시군구 코드 → 시도/시군구명 매핑 추출
+    sgg_map = {}
+    for key, info in emd_dict.items():
+        sgg_cd = info.get("sgg_cd") or info.get("emd_cd", "")[:5]
+        if sgg_cd and sgg_cd not in sgg_map:
+            sgg_map[sgg_cd] = {
+                "sido_nm": info["sido_nm"],
+                "sgg_nm":  info["sgg_nm"],
+            }
+
+    # ══════════════════════════════════════════
+    # Phase 1: 아파트 수집 (시군구 코드 기반)
+    # ══════════════════════════════════════════
+    log("\n" + "=" * 60)
+    log("📌 Phase 1: 아파트 수집 (시군구 코드 기반)")
+    log("=" * 60)
+
+    apt_sggs = [
+        (sgg_cd, info)
+        for sgg_cd, info in sgg_map.items()
+        if (not TARGET_SIDO or info["sido_nm"] in TARGET_SIDO)
+        and not already_done(f"APT_SGG_{sgg_cd}")
+    ]
+    log(f"  수집 대상: {len(apt_sggs)}개 시군구")
+
+    apt_total = 0
+    if apt_sggs:
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            futures = {
+                executor.submit(
+                    collect_apt_for_sgg, sgg_cd,
+                    info["sido_nm"], info["sgg_nm"]
+                ): sgg_cd
+                for sgg_cd, info in apt_sggs
+            }
+            for i, future in enumerate(as_completed(futures), 1):
+                sgg_cd = futures[future]
+                try:
+                    cnt = future.result()
+                    apt_total += cnt
+                    if i % 20 == 0 or i == len(apt_sggs):
+                        log(f"  📊 아파트 {i}/{len(apt_sggs)} | 누적: {apt_total:,}개")
+                except Exception as e:
+                    log(f"  ❌ 아파트 {sgg_cd} 오류: {e}")
+
+    log(f"  ✅ 아파트 수집 완료: {apt_total:,}개")
+
+    # ══════════════════════════════════════════
+    # Phase 2: 원룸/빌라/오피스텔/상가 (geohash)
+    # ══════════════════════════════════════════
+    log("\n" + "=" * 60)
+    log("📌 Phase 2: 원룸·빌라·오피스텔·상가 수집 (geohash 기반)")
+    log("=" * 60)
+
+    targets = [
+        (key, info)
+        for key, info in emd_dict.items()
+        if (not TARGET_SIDO or info["sido_nm"] in TARGET_SIDO)
+        and not all(already_done(f"{key}_{lb}") for lb in NON_APT_LABELS)
+    ]
+
+    sido_counts = defaultdict(int)
+    for _, info in targets:
+        sido_counts[info["sido_nm"]] += 1
+    for sido, cnt in sorted(sido_counts.items()):
+        log(f"  {sido}: {cnt}개 읍면동")
+    log(f"  총 수집 대상: {len(targets)}개 읍면동")
+
+    non_apt_total = 0
+    total = len(targets)
+
+    if targets:
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            futures = {
+                executor.submit(collect_emd_non_apt, key, info): key
+                for key, info in targets
+            }
+            for i, future in enumerate(as_completed(futures), 1):
+                emd_key = futures[future]
+                try:
+                    _, rows = future.result()
+                    non_apt_total += len(rows)
+                    if i % 100 == 0 or i == total:
+                        log(
+                            f"  📊 {i}/{total} ({i/total*100:.1f}%)"
+                            f" | 누적: {non_apt_total:,}개"
+                        )
+                except Exception as e:
+                    log(f"  ❌ {emd_key} 오류: {e}")
+
+    # ── 최종 요약 ──────────────────────────────────────────
+    grand_total = apt_total + non_apt_total
+    log("\n" + "=" * 60)
+    log("🎉 전국 전 유형 수집 완료!")
+    log(f"   아파트:                    {apt_total:,}개")
+    log(f"   원룸/빌라/오피스텔/상가:  {non_apt_total:,}개")
+    log(f"   합계 (수집):               {grand_total:,}개")
+    log(f"   통합 CSV (중복제거):       {len(_written_ids):,}개")
+    log(f"📁 {MASTER_CSV.name}")
+    log("=" * 60)
+
 
 if __name__ == "__main__":
     main()
