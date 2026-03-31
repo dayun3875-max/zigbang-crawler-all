@@ -3,6 +3,7 @@ import csv
 import time
 import random
 import threading
+import functools
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
@@ -18,12 +19,15 @@ TOTAL_CSV = BASE_DIR / f"전국전체_{timestamp}.csv"
 LOG_FILE  = BASE_DIR / f"전국전체_{timestamp}_log.txt"
 
 # =========================
-# ⚡ 병렬 처리 설정
+# ⚡ 병렬 처리 설정 (보수적으로 조정)
 # =========================
-MAX_WORKERS_SIGUNGU  = 10   # 시군구 병렬 수
-MAX_WORKERS_DONG     = 5    # 동 병렬 수 (시군구당)
-REQUEST_SEMAPHORE    = threading.Semaphore(20)  # 동시 요청 상한
-MIN_SLEEP            = 0.1  # 최소 딜레이 (초)
+MAX_WORKERS_SIGUNGU  = 5    # 10 → 5 (행안부 API 부하 감소)
+MAX_WORKERS_DONG     = 3    # 5  → 3
+REQUEST_SEMAPHORE    = threading.Semaphore(10)  # 20 → 10
+MIN_SLEEP            = 0.3  # 0.1 → 0.3 (딜레이 증가)
+
+# 행안부 API 전용 세마포어 (직방과 분리)
+HANABU_SEMAPHORE     = threading.Semaphore(5)
 
 # =========================
 # 🔤 매핑
@@ -168,24 +172,44 @@ def log(msg):
 
 # =========================
 # 행안부 API → 동 코드 목록
+# ✅ 수정: 전용 세마포어 + 최대 5회 재시도 + lru_cache로 중복 호출 방지
 # =========================
+@functools.lru_cache(maxsize=None)
 def get_dong_codes(sigungu_5):
     url = "https://grpc-proxy-server-mkvo6j4wsq-du.a.run.app/v1/regcodes"
     params = {"regcode_pattern": f"{sigungu_5}*", "is_ignore_zero": "true"}
-    try:
-        with REQUEST_SEMAPHORE:
-            res = requests.get(url, params=params, timeout=15)
-        if res.status_code == 200:
-            codes = res.json().get("regcodes", [])
-            return [(c["code"][:8], c["name"]) for c in codes]
-    except Exception as e:
-        log(f"❌ 행안부 API 오류 ({sigungu_5}): {e}")
+
+    for attempt in range(5):
+        try:
+            with HANABU_SEMAPHORE:
+                res = requests.get(url, params=params, timeout=15)
+
+            if res.status_code == 200:
+                codes = res.json().get("regcodes", [])
+                return [(c["code"][:8], c["name"]) for c in codes]
+
+            elif res.status_code == 429:
+                wait = 5 * (attempt + 1)
+                log(f"⏳ 행안부 API rate limit ({sigungu_5}), {wait}초 대기 후 재시도 [{attempt+1}/5]...")
+                time.sleep(wait)
+
+            else:
+                log(f"⚠ 행안부 API HTTP {res.status_code} ({sigungu_5}), 재시도 [{attempt+1}/5]")
+                time.sleep(2 * (attempt + 1))
+
+        except Exception as e:
+            wait = 2 * (attempt + 1)
+            log(f"❌ 행안부 API 오류 ({sigungu_5}): {e} → {wait}초 후 재시도 [{attempt+1}/5]")
+            time.sleep(wait)
+
+    log(f"🚫 행안부 API 최종 실패 ({sigungu_5}): 동코드 조회 불가")
     return []
 
 # =========================
 # 직방 API (동 단위) - 재시도 포함
+# ✅ 수정: 429 발생 시 재시도 횟수 증가, 대기시간 증가
 # =========================
-def fetch_by_dong(dong_code, retries=2):
+def fetch_by_dong(dong_code, retries=3):
     url = f"https://apis.zigbang.com/apt/locals/{dong_code}/item-catalogs"
     all_items = []
     offset = 0
@@ -207,12 +231,14 @@ def fetch_by_dong(dong_code, retries=2):
             except Exception:
                 if attempt == retries:
                     return all_items
-                time.sleep(0.5)
+                time.sleep(1 * (attempt + 1))
 
         if res.status_code == 429:
-            # Rate limit → 잠시 대기 후 재시도
-            time.sleep(3 + random.uniform(0, 1))
+            wait = 5 + random.uniform(0, 3)
+            log(f"⏳ 직방 API rate limit (dong={dong_code}), {wait:.1f}초 대기...")
+            time.sleep(wait)
             continue
+
         if res.status_code != 200:
             break
 
@@ -229,7 +255,7 @@ def fetch_by_dong(dong_code, retries=2):
             break
 
         offset += PAGE_LIMIT
-        time.sleep(MIN_SLEEP + random.uniform(0, 0.1))  # 최소 딜레이
+        time.sleep(MIN_SLEEP + random.uniform(0, 0.2))
 
     return all_items
 
@@ -268,15 +294,16 @@ def parse_row(item):
 
 # =========================
 # 시군구 단위 작업 (병렬 실행 단위)
+# ✅ 수정: 동코드 조회 실패 시 경고 로그 출력
 # =========================
 def process_sigungu(district_name, sigungu_5):
     dong_list = get_dong_codes(sigungu_5)
     if not dong_list:
+        log(f"⚠ 동코드 없음 → 건너뜀: {district_name} ({sigungu_5})")
         return district_name, []
 
     local_items = []
 
-    # 동 단위 병렬 호출
     with ThreadPoolExecutor(max_workers=MAX_WORKERS_DONG) as dong_exec:
         futures = {dong_exec.submit(fetch_by_dong, dong_code): dong_name
                    for dong_code, dong_name in dong_list}
@@ -303,46 +330,98 @@ def save_csv(rows, path):
 
 # =========================
 # 메인
+# ✅ 수정: 실패 지역 자동 재수집 로직 추가
 # =========================
 def main():
-    log("==== 전국 매물 수집 시작 (병렬 최적화) ====")
+    log("==== 전국 매물 수집 시작 (안정화 버전) ====")
     log(f"⚙ 시군구 병렬: {MAX_WORKERS_SIGUNGU} / 동 병렬: {MAX_WORKERS_DONG} / 동시 요청 상한: {REQUEST_SEMAPHORE._value}")
 
     all_items = []
     seen = set()
     seen_lock = threading.Lock()
+    failed_districts = {}   # 실패(매물없음) 지역 기록
 
     total = len(SIGUNGU_CODES)
     completed = 0
     start_time = time.time()
 
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS_SIGUNGU) as executor:
-        futures = {
-            executor.submit(process_sigungu, name, code): name
-            for name, code in SIGUNGU_CODES.items()
-        }
+    def run_collection(codes_dict, pass_label="1차"):
+        nonlocal completed
+        failed = {}
 
-        for future in as_completed(futures):
-            district_name, rows = future.result()
-            completed += 1
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS_SIGUNGU) as executor:
+            futures = {
+                executor.submit(process_sigungu, name, code): (name, code)
+                for name, code in codes_dict.items()
+            }
 
-            new_count = 0
-            with seen_lock:
-                for r in rows:
-                    uid = r.get("매물ID")
-                    if uid and uid not in seen:
-                        seen.add(uid)
-                        all_items.append(r)
-                        new_count += 1
+            for future in as_completed(futures):
+                district_name, rows = future.result()
+                completed += 1
 
-            elapsed = time.time() - start_time
-            eta = (elapsed / completed) * (total - completed) if completed else 0
-            status = f"✅ {new_count}개" if new_count else "⚠ 매물없음"
-            log(f"[{completed}/{total}] {district_name}: {status} | "
-                f"경과 {elapsed/60:.1f}분 / 예상잔여 {eta/60:.1f}분")
+                new_count = 0
+                with seen_lock:
+                    for r in rows:
+                        uid = r.get("매물ID")
+                        if uid and uid not in seen:
+                            seen.add(uid)
+                            all_items.append(r)
+                            new_count += 1
+
+                elapsed = time.time() - start_time
+                eta = (elapsed / completed) * (total - completed) if completed else 0
+                if new_count:
+                    log(f"[{pass_label}][{completed}/{total}] {district_name}: ✅ {new_count}개 | "
+                        f"경과 {elapsed/60:.1f}분 / 예상잔여 {eta/60:.1f}분")
+                else:
+                    log(f"[{pass_label}][{completed}/{total}] {district_name}: ⚠ 매물없음 | "
+                        f"경과 {elapsed/60:.1f}분 / 예상잔여 {eta/60:.1f}분")
+                    name_, code_ = futures[future]
+                    failed[name_] = code_
+
+        return failed
+
+    # --- 1차 수집 ---
+    failed_districts = run_collection(SIGUNGU_CODES, pass_label="1차")
+
+    # --- 2차 재수집: 실패 지역만 (캐시 무효화 후 재시도) ---
+    if failed_districts:
+        log(f"\n🔄 2차 재수집 시작: 실패 {len(failed_districts)}개 지역")
+        log("⏳ 30초 대기 후 재시도 (API 안정화)...")
+        time.sleep(30)
+
+        # lru_cache 무효화 → 행안부 API 재호출
+        get_dong_codes.cache_clear()
+
+        completed = len(SIGUNGU_CODES) - len(failed_districts)  # 이미 완료된 수
+        total_2nd = len(failed_districts)
+        completed_2nd = 0
+
+        with ThreadPoolExecutor(max_workers=max(1, MAX_WORKERS_SIGUNGU // 2)) as executor:
+            futures = {
+                executor.submit(process_sigungu, name, code): (name, code)
+                for name, code in failed_districts.items()
+            }
+            for future in as_completed(futures):
+                district_name, rows = future.result()
+                completed_2nd += 1
+
+                new_count = 0
+                with seen_lock:
+                    for r in rows:
+                        uid = r.get("매물ID")
+                        if uid and uid not in seen:
+                            seen.add(uid)
+                            all_items.append(r)
+                            new_count += 1
+
+                elapsed = time.time() - start_time
+                status = f"✅ {new_count}개" if new_count else "⚠ 여전히 매물없음"
+                log(f"[2차 재수집][{completed_2nd}/{total_2nd}] {district_name}: {status} | "
+                    f"총 경과 {elapsed/60:.1f}분")
 
     if not all_items:
-        log("❌ 전체 데이터 없음")
+        log("❌ 전체 데이터 없음 - 저장 생략")
         return
 
     save_csv(all_items, TOTAL_CSV)
