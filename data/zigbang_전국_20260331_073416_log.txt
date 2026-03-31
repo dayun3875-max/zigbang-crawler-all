@@ -1,0 +1,15 @@
+[2026-03-31 07:34:16] ✅ 완료 캐시 로드: 0개
+[2026-03-31 07:34:16] ============================================================
+[2026-03-31 07:34:16] 직방 전국 전 유형 매물 수집 시작 (v7 전국판)
+[2026-03-31 07:34:16] 대상: 아파트 · 원룸 · 투룸빌라 · 오피스텔 · 상가사무실
+[2026-03-31 07:34:16] 저장경로: /home/runner/work/zigbang-crawler-all/zigbang-crawler-all/data
+[2026-03-31 07:34:16] 병렬: 8개 | 아파트 limit=20
+[2026-03-31 07:34:16] 기타: geohash step=0.04 | chunk=50개
+[2026-03-31 07:34:16] 수집 시도: 전국
+[2026-03-31 07:34:16] ============================================================
+[2026-03-31 07:34:16] 🌐 브이월드 API 전국 읍면동 수집 시작...
+[2026-03-31 07:34:17]   ❌ 브이월드 오류 (1/3): ('Connection aborted.', RemoteDisconnected('Remote end closed connection without response'))
+[2026-03-31 07:34:21]   ❌ 브이월드 오류 (2/3): ('Connection aborted.', RemoteDisconnected('Remote end closed connection without response'))
+[2026-03-31 07:34:25]   ❌ 브이월드 오류 (3/3): ('Connection aborted.', RemoteDisconnected('Remote end closed connection without response'))
+[2026-03-31 07:34:28] ✅ 읍면동 수집 완료: 0개 → 캐시 저장
+[2026-03-31 07:34:28] ❌ 읍면동 목록 수집 실패 → 종료
