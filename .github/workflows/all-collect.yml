@@ -8,7 +8,7 @@ permissions:
 jobs:
   run-script:
     runs-on: ubuntu-latest
-    timeout-minutes: 300        # 최대 5시간 (기본 360분보다 여유있게 설정)
+    timeout-minutes: 300
     steps:
       - uses: actions/checkout@v4
       - name: Python 설치
@@ -16,7 +16,7 @@ jobs:
         with:
           python-version: '3.10'
       - name: 라이브러리 설치
-        run: pip install requests
+        run: pip install requests pygeohash
       - name: 스크립트 실행
         run: python all_1.py
       - name: 결과 저장
