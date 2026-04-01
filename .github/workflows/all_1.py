@@ -3,14 +3,14 @@
 ======================================================================
 대상: 아파트 / 원룸 / 빌라·투룸+ / 오피스텔 / 상가·사무실
 저장: CSV (UTF-8 BOM, 엑셀 호환)
-실행: pip install requests
+실행: pip install requests pygeohash
 
 [v9 + 성공코드 합산 개선]
   아파트
     - 행안부 regcodes API로 읍면동 코드 취득 (성공코드 방식, 검증됨)
     - 읍면동별 /apt/locals/{code}/item-catalogs 호출 → 읍면동 컬럼 기록
   원룸/빌라/오피스텔/상가
-    - 순수 Python 지오해시 인코더 (외부 라이브러리 불필요, 성공코드)
+    - pygeohash 사용 (C 확장, 타일 경계 오차 없음)
     - 적응형 세분화: precision=5 시작 → 매물 ≥ SUBDIVIDE_THRESHOLD 이면
       precision=7까지 자동 재귀 분할 (밀집 지역만 세분화)
     - 주소 파싱으로 읍면동 컬럼 자동 보완
@@ -22,6 +22,7 @@
 """
 
 import requests
+import pygeohash as pgh
 import time
 import random
 import csv
@@ -171,54 +172,9 @@ STORE_FIELDS = [
 ]
 
 # ─────────────────────────────────────────────────────────
-#  순수 Python 지오해시 (외부 라이브러리 불필요)
+#  지오해시 유틸 (pygeohash 사용 - C 확장, 경계 오차 없음)
 # ─────────────────────────────────────────────────────────
 _B32 = "0123456789bcdefghjkmnpqrstuvwxyz"
-
-
-def geohash_encode(lat: float, lng: float, precision: int = 5) -> str:
-    lat_r = [-90.0, 90.0]
-    lng_r = [-180.0, 180.0]
-    result, even, ch, bit = "", True, 0, 4
-    while len(result) < precision:
-        if even:
-            mid = (lng_r[0] + lng_r[1]) / 2
-            if lng >= mid:
-                ch |= (1 << bit); lng_r[0] = mid
-            else:
-                lng_r[1] = mid
-        else:
-            mid = (lat_r[0] + lat_r[1]) / 2
-            if lat >= mid:
-                ch |= (1 << bit); lat_r[0] = mid
-            else:
-                lat_r[1] = mid
-        even = not even
-        if bit == 0:
-            result += _B32[ch]; ch = 0; bit = 4
-        else:
-            bit -= 1
-    return result
-
-
-def geohash_bounds(gh: str) -> dict:
-    lat_r = [-90.0, 90.0]
-    lng_r = [-180.0, 180.0]
-    even = True
-    for c in gh:
-        idx = _B32.index(c)
-        for bit in (4, 3, 2, 1, 0):
-            if even:
-                mid = (lng_r[0] + lng_r[1]) / 2
-                if idx & (1 << bit): lng_r[0] = mid
-                else:                lng_r[1] = mid
-            else:
-                mid = (lat_r[0] + lat_r[1]) / 2
-                if idx & (1 << bit): lat_r[0] = mid
-                else:                lat_r[1] = mid
-            even = not even
-    return {"lat_min": lat_r[0], "lat_max": lat_r[1],
-            "lng_min": lng_r[0], "lng_max": lng_r[1]}
 
 
 def subdivide_geohash(gh: str) -> list:
@@ -227,13 +183,13 @@ def subdivide_geohash(gh: str) -> list:
 
 
 def is_in_korea(gh: str) -> bool:
-    b = geohash_bounds(gh)
-    clat = (b["lat_min"] + b["lat_max"]) / 2
-    clng = (b["lng_min"] + b["lng_max"]) / 2
-    return (32.5 <= clat <= 39.0) and (124.0 <= clng <= 131.0)
+    """타일 중심점이 남한 영역 안에 있는지 확인"""
+    lat, lng, _, _ = pgh.decode_exactly(gh)[:4]
+    return (32.5 <= lat <= 39.0) and (124.0 <= lng <= 131.0)
 
 
 def korea_geohashes(precision: int = 5) -> list:
+    """남한 전체를 커버하는 지오해시 타일 목록"""
     LAT_MIN, LAT_MAX = 33.0, 38.8
     LNG_MIN, LNG_MAX = 124.5, 130.1
     step_map = {
@@ -246,10 +202,11 @@ def korea_geohashes(precision: int = 5) -> list:
     while lat <= LAT_MAX:
         lng = LNG_MIN
         while lng <= LNG_MAX:
-            seen.add(geohash_encode(lat, lng, precision))
+            seen.add(pgh.encode(lat, lng, precision))
             lng += slng
         lat += slat
     return sorted(seen)
+
 
 
 # ─────────────────────────────────────────────────────────
