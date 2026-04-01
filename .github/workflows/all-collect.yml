@@ -1,28 +1,44 @@
 name: zigbang_all_collect
+
 on:
   schedule:
-    - cron: '0 2 * * *'
-  workflow_dispatch:
+    - cron: '0 2 * * *'   # 매일 오전 11시 (KST = UTC+9)
+  workflow_dispatch:       # 수동 실행 허용
+
 permissions:
   contents: write
+
 jobs:
   run-script:
     runs-on: ubuntu-latest
-    timeout-minutes: 300
+    timeout-minutes: 360   # 전국 수집 여유있게 6시간
+
     steps:
-      - uses: actions/checkout@v4
+      - name: 체크아웃
+        uses: actions/checkout@v4
+
       - name: Python 설치
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
+
       - name: 라이브러리 설치
         run: pip install requests pygeohash
+
       - name: 스크립트 실행
         run: python all_1.py
-      - name: 결과 저장
+
+      - name: 결과 커밋 & 푸시
         run: |
           git config --global user.name "github-actions"
           git config --global user.email "actions@github.com"
-          git add data/*.csv data/*.txt
-          git diff --staged --quiet || git commit -m "daily zigbang data $(date +'%Y-%m-%d')"
-          git push https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git
+
+          # 날짜 하위폴더까지 포함해서 add
+          git add zigbang_data/ || true
+          git add data/ || true
+
+          # 변경사항 없으면 커밋 스킵
+          git diff --staged --quiet && echo "변경사항 없음, 스킵" && exit 0
+
+          git commit -m "daily zigbang data $(date +'%Y-%m-%d')"
+          git push origin HEAD
